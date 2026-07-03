@@ -76,6 +76,6 @@ To run the pipeline from stage i to stage j (assuming the pipeline has already b
 python app.py video.mp4 --start-stage i --end-stage j
 ```
 ### If you want to run the pipeline for many videos :
-You need to run : `run_pipeline_batch.sh`
-```run_pipeline_batch.sh repositorie_for_video ```
+You need to run : `run_pipeline_batch.sh` . This function using `app.py ` for running many videos, you use it like yhis : 
+```run_pipeline_batch.sh repositorie_for_videos ```
 
