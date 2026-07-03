@@ -1,0 +1,22 @@
+[regions]
+eyes_region = [171, 133, 174, 166, 99, 95, 19, 18, 17, 16, 15, 461, 339, 237, 238, 324, 311, 397, 404, 362, 401, 360]
+mouth_region = [339, 461, 15, 44, 35, 45, 43, 49, 46, 267, 266, 273, 263, 265, 255, 264, 341]
+face_region = [457, 358, 400, 364, 413, 446, 305, 340, 233, 374, 335, 409, 295, 331, 317, 318, 291, 319, 315, 90, 67, 89, 88, 102, 70, 179, 106, 144, 13, 111, 78, 216, 183, 135, 170, 129, 457]
+unnamed__region_2 = []
+
+
+[denoising]
+denoising_filter_degree = 2
+denoising_filter_window = 5
+
+[interpolation]
+max_interpolation_distance = 10
+
+[face_detection]
+rotation_step = 16
+
+[body_detection]
+inertia = 8
+
+[foreground_detection]
+batch_size = 2
