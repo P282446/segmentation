@@ -56,7 +56,7 @@ Use {q} to confirm the selected zones and quit.
 Once you press q and exit, a new configuration file is created in `configurations/`
 Rename it to `config.txt` and you are good to go!
 
-### Running the pipeline 
+### Running the pipeline  
 
 The pipeline consists of 6 stages:
 1. Frame by frame face and landmarks detection
@@ -75,3 +75,7 @@ To run the pipeline from stage i to stage j (assuming the pipeline has already b
 ```
 python app.py video.mp4 --start-stage i --end-stage j
 ```
+### If you want to run the pipeline for many videos :
+You need to run : `run_pipeline_batch.sh`
+```run_pipeline_batch.sh repositorie_for_video ```
+
