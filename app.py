@@ -20,7 +20,7 @@ def parse_arguments():
 
 def main():
     args = parse_arguments()
-    full_pipeline(args.input_file,
+    final_path =  full_pipeline(args.input_file,
                   args.output_directory,
                   start_stage=args.start_stage,
                   end_stage=args.end_stage)
