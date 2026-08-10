@@ -22,7 +22,7 @@ find "$SOURCE_DIR" -type f \( "${FIND_ARGS[@]}" \) | while read -r video_path; d
     echo "Sortie dans   : $output_dir"
     echo "=================================================="
 
-    python app.py "$video_path" "$output_dir"
+    /usr/bin/python3.9 app.py "$video_path" "$output_dir"
 
     if [ $? -eq 0 ]; then
         echo "✅ Terminé : $video_path"
