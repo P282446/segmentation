@@ -1,5 +1,5 @@
 import argparse
-from media.pipelines_bis import full_pipeline
+from media.pipelines_bis2 import full_pipeline
 
 
 def parse_arguments():
