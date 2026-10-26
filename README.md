@@ -78,5 +78,8 @@ python app.py video.mp4 --start-stage i --end-stage j
 ### If you want to run the pipeline for many videos :
 You need to run : `run_pipeline_batch.sh` . This function using `app.py ` for running many videos in the same 
 directory, you run it like this : 
-```./run_pipeline_batch.sh directory_for_videos ``` # Activer l'environnement conda activate eyevision
+```./run_pipeline_batch.sh directory_for_videos ```
+
+#You'll this virtuel environment : ` conda activate eyevision `
+
 
