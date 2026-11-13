@@ -46,7 +46,8 @@ packaging==24.0
 pandas==2.2.1
 pillow==10.2.0
 platformdirs==4.2.0
-protobuf==3.20.3
+#protobuf==3.20.3
+protobuf==4.25.3
 psutil==5.9.8
 py-cpuinfo==9.0.0
 pycparser==2.22
