@@ -2,7 +2,5 @@
 __pycache__/
 *.pyc
 Miniconda3-latest-Linux-x86_64.sh
-models/*
-!models/YOLOv8-face-detection.pt
 *.bin
 Miniforge3-Linux-x86_64.sh
