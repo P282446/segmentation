@@ -1,0 +1,322 @@
+
+# -*- coding: utf-8 -*-
+
+# =====================================================================
+#              PIPELINE DE SEGMENTATION ET EVALUATION
+# =====================================================================
+#
+# 1. DESCRIPTION DU PROGRAMME
+# ---------------------------------------------------------------------
+#
+# Ce programme permet d'automatiser la segmentation d'un ensemble
+# de videos et d'evaluer la qualite de leur segmentation.
+#
+# Il parcourt recursivement un dossier contenant les videos originales
+# et execute le programme app.py pour segmenter chaque video.
+#
+# Une fois la segmentation terminee, il analyse chaque frame de la
+# video segmentee afin de detecter les anomalies de segmentation.
+#
+# L'evaluation de la qualite repose sur les criteres suivants :
+#
+#   - La presence des couleurs caracteristiques de la segmentation ;
+#   - Les proportions des differentes regions anatomiques ;
+#   - La comparaison des surfaces entre les regions ;
+#   - La coherence spatiale des regions anatomiques ;
+#   - La coherence geometrique des regions ;
+#   - La coherence temporelle entre les frames successives.
+#
+# Les regions anatomiques considerees sont :
+#
+#   - Les yeux ;
+#   - Le nez et la bouche ;
+#   - Le visage ;
+#   - Le haut du corps ;
+#   - Le reste de la tete.
+#
+#
+# 2. FONCTIONNALITES DU PROGRAMME
+# ---------------------------------------------------------------------
+#
+#   - Recherche automatique des videos dans les sous-dossiers ;
+#   - Segmentation automatique des videos ;
+#   - Calcul du nombre total de frames de chaque video ;
+#   - Calcul de la duree de chaque video en secondes ;
+#   - Mesure du temps d'execution de la segmentation ;
+#   - Evaluation automatique de la qualite de chaque frame ;
+#   - Calcul des pourcentages de frames bien et mal segmentees ;
+#   - Affichage de la progression avec tqdm ;
+#   - Sauvegarde automatique des resultats ;
+#   - Gestion des interruptions ;
+#   - Reprise automatique apres un arret du programme ;
+#   - Gestion du temps de reservation sur Grid'5000.
+#
+#
+# 3. GESTION DES RESERVATIONS SUR GRID'5000
+# ---------------------------------------------------------------------
+#
+# Ce programme est concu pour traiter un grand nombre de videos
+# dont le temps total de segmentation peut depasser la duree
+# d'une reservation interactive sur Grid'5000.
+#
+# L'etat d'avancement est sauvegarde automatiquement dans un fichier
+# JSON afin de permettre la reprise du traitement lors d'une
+# nouvelle reservation.
+#
+# Lors du redemarrage :
+#
+#   - Les videos entierement traitees sont ignorees ;
+#   - Les segmentations interrompues sont relancees ;
+#   - Les videos deja segmentees ne sont pas segmentees de nouveau ;
+#   - Les evaluations interrompues sont relancees.
+#
+# Une marge de securite permet d'arreter le programme avant
+# l'expiration du temps de calcul disponible.
+#
+# La reprise s'effectue au niveau des videos et des etapes de
+# traitement, et non au niveau de chaque frame.
+#
+#
+# 4. DEPENDANCES NECESSAIRES
+# ---------------------------------------------------------------------
+#
+# Bibliotheques Python externes :
+#
+#   - opencv-python : lecture et analyse des videos ;
+#   - numpy         : calculs numeriques et traitement des pixels ;
+#   - pandas        : manipulation et exportation des resultats ;
+#   - tqdm          : affichage des barres de progression.
+#
+# Bibliotheques standards de Python :
+#
+#   - subprocess
+#   - argparse
+#   - time
+#   - signal
+#   - json
+#   - csv
+#   - sys
+#   - os
+#   - shutil
+#   - pathlib
+#   - collections
+#
+# Les bibliotheques standards ne necessitent aucune installation.
+#
+# Installation des bibliotheques externes :
+#
+#   python -m pip install opencv-python numpy pandas tqdm
+#
+# Les dependances du pipeline de segmentation doivent egalement
+# etre installees dans le meme environnement Python.
+#
+# Si un fichier requirements.txt est disponible :
+#
+#   python -m pip install -r requirements.txt
+#
+#
+# 5. ORGANISATION DU PIPELINE
+# ---------------------------------------------------------------------
+#
+# Le programme evaluation_segmentation.py doit etre place dans
+# le meme dossier que app.py et controle_qualite.py.
+#
+# segmentation/
+# |
+# |-- app.py
+# |-- evaluation_segmentation.py
+# |-- controle_qualite.py
+# |-- run_pipeline_batch.sh
+# |-- requirements.txt
+# |-- models/
+#     |-- YOLOv8-face-detection.pt
+#
+# Le programme appelle directement app.py. Il n'est donc pas
+# necessaire d'executer separement run_pipeline_batch.sh.
+#
+#
+# 6. DONNEES D'ENTREE
+# ---------------------------------------------------------------------
+#
+# Le programme prend en entree un dossier contenant les videos
+# originales a segmenter.
+#
+# Les extensions de videos prises en charge sont :
+#
+#   - .mp4
+#   - .wmv
+#   - .avi
+#   - .mov
+#   - .mkv
+#
+# Les videos peuvent etre organisees dans plusieurs sous-dossiers.
+#
+#
+# 7. DONNEES DE SORTIE
+# ---------------------------------------------------------------------
+#
+# Le programme genere les fichiers suivants :
+#
+#   resultats_segmentation.csv :
+#       Fichier contenant les statistiques globales de segmentation
+#       pour chaque video.
+#
+#   etat_avancement.json :
+#       Fichier contenant l'etat d'avancement du traitement.
+#       Il permet de reprendre le programme apres une interruption.
+#
+#   qualite_segmentation.csv :
+#       Fichier detaille genere pour chaque video, contenant
+#       la qualite de segmentation de chaque frame, les proportions
+#       des regions et les raisons des anomalies detectees.
+#
+#   seg_<nom_video> :
+#       Video produite par le pipeline de segmentation.
+#
+#
+# 8. STRUCTURE DU FICHIER CSV GLOBAL
+# ---------------------------------------------------------------------
+#
+# Le fichier resultats_segmentation.csv contient les colonnes :
+#
+#   video :
+#       Nom ou chemin relatif de la video analysee.
+#
+#   nombre_total_frames :
+#       Nombre total de frames de la video originale.
+#
+#   pct_frames_correctement_segmentees :
+#       Pourcentage de frames considerees comme bien segmentees
+#       selon les criteres de validation.
+#
+#   pct_frames_mal_segmentees :
+#       Pourcentage de frames considerees comme mal segmentees.
+#
+#   duree_video_secondes :
+#       Duree estimee de la video originale, en secondes.
+#
+#   duree_segmentation_secondes :
+#       Temps d'execution de la segmentation, en secondes.
+#       Cette duree ne comprend ni le temps d'evaluation de la
+#       qualite ni celui des tentatives de segmentation interrompues.
+#
+#
+# 9. UTILISATION DU PROGRAMME
+# ---------------------------------------------------------------------
+#
+# Syntaxe generale :
+#
+#   python evaluation_segmentation.py SOURCE_DIR OUTPUT_DIR \
+#       --heures 12 --marge 10
+#
+# Description des arguments :
+#
+#   SOURCE_DIR :
+#       Chemin vers le dossier contenant les videos originales.
+#
+#   OUTPUT_DIR :
+#       Chemin vers le dossier de sauvegarde des resultats.
+#
+#   --heures :
+#       Temps de calcul restant disponible, exprime en heures.
+#       Valeur par defaut : 12 heures.
+#
+#   --marge :
+#       Marge de securite avant la fin du temps de calcul,
+#       exprimee en minutes.
+#       Valeur par defaut : 10 minutes.
+#
+# Exemple :
+#
+#   python evaluation_segmentation.py \
+#       ~/Bureau/videos \
+#       ~/Bureau/resultats_segmentation \
+#       --heures 12 \
+#       --marge 10
+#
+# Affichage de l'aide :
+#
+#   python evaluation_segmentation.py --help
+#
+#
+# 10. EXECUTION SUR GRID'5000
+# ---------------------------------------------------------------------
+#
+# Etape 1 : Effectuer une reservation interactive.
+#
+#   oarsub -I -l gpu=1,walltime=12:00:00
+#
+# La syntaxe de reservation peut varier selon le cluster utilise.
+#
+# Etape 2 : Activer l'environnement Python de segmentation.
+#
+# Etape 3 : Se placer dans le dossier du pipeline.
+#
+#   cd ~/Bureau/segmentation/segmenter/segmentation
+#
+# Etape 4 : Executer le programme.
+#
+#   python evaluation_segmentation.py \
+#       ~/Bureau/videos \
+#       ~/Bureau/resultats_segmentation \
+#       --heures 12 \
+#       --marge 10
+#
+# IMPORTANT :
+#
+# La valeur de --heures doit correspondre au temps restant de
+# la reservation au moment du lancement du programme.
+#
+#
+# 11. REPRISE APRES UNE INTERRUPTION
+# ---------------------------------------------------------------------
+#
+# Apres la fin d'une reservation, effectuer une nouvelle reservation,
+# activer l'environnement Python et relancer la meme commande
+# avec les memes dossiers d'entree et de sortie.
+#
+# Le programme reprend automatiquement les traitements restants
+# en utilisant le fichier etat_avancement.json.
+#
+# Il ne faut donc pas supprimer ce fichier ni les videos deja
+# segmentees entre deux reservations.
+#
+# Les resultats doivent etre conserves dans un espace de stockage
+# persistant et accessible entre les differentes reservations.
+#
+#
+# 12. SUIVI DE LA PROGRESSION
+# ---------------------------------------------------------------------
+#
+# Les barres de progression tqdm permettent de suivre :
+#
+#   - La progression globale du traitement des videos ;
+#   - La lecture de la video originale ;
+#   - Le temps ecoule pendant la segmentation ;
+#   - La progression de l'evaluation frame par frame ;
+#   - Le nombre de frames correctes et incorrectes detectees.
+#
+# L'affichage de la progression reelle de la segmentation,
+# en nombre de frames, necessite une barre tqdm dans app.py.
+#
+#
+# 13. LIMITES METHODOLOGIQUES
+# ---------------------------------------------------------------------
+#
+# L'evaluation automatique repose sur une approche heuristique
+# combinant des criteres colorimetriques, anatomiques,
+# geometriques, spatiaux et temporels.
+#
+# Une frame consideree comme correcte par le programme n'est pas
+# necessairement parfaitement segmentee.
+#
+# Les seuils de validation doivent etre calibres sur un ensemble
+# representatif de frames annotees manuellement.
+#
+# La duree des videos est estimee a partir du nombre total de
+# frames et de la frequence d'images (FPS).
+#
+# Le programme doit etre teste dans l'environnement Grid'5000
+# avant son utilisation sur l'ensemble des videos.
+#
+# =====================================================================
