@@ -1,6 +1,10 @@
+# Modeles preentraines
+
+# Environnements Python
 .venv/
+venv/
+Miniforge3-Linux-x86_64.sh
+# Cache Python
 __pycache__/
-*.pyc
-Miniconda3-latest-Linux-x86_64.sh
-*.bin
+
 Miniforge3-Linux-x86_64.sh
