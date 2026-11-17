@@ -1,20 +1,159 @@
 
+# -*- coding: utf-8 -*-
+
+# =====================================================================
+#          PIPELINE DE SEGMENTATION ET EVALUATION DE LA QUALITE
+# =====================================================================
+#
+# DESCRIPTION
+# ---------------------------------------------------------------------
+# Ce programme permet de segmenter automatiquement un ensemble de
+# videos et d'evaluer la qualite de leur segmentation.
+#
+# L'evaluation repose sur plusieurs criteres :
+#
+#   - Presence des couleurs caracteristiques de la segmentation ;
+#   - Proportions des cinq regions anatomiques ;
+#   - Comparaison des surfaces des regions ;
+#   - Coherence spatiale et geometrique ;
+#   - Coherence temporelle entre les frames successives.
+#
+# Le programme est adapte aux reservations de calcul sur Grid'5000.
+# Il sauvegarde son etat d'avancement et reprend automatiquement
+# les traitements restants apres une interruption.
+#
+# DEPENDANCES
+# ---------------------------------------------------------------------
+#
+# Bibliotheques Python externes :
+#
+#   - opencv-python
+#   - numpy
+#   - pandas
+#   - tqdm
+#
+# Installation :
+#
+#   python -m pip install opencv-python numpy pandas tqdm
+#
+# Les dependances de app.py doivent egalement etre installees.
+#
+# ORGANISATION
+# ---------------------------------------------------------------------
+#
+# Le programme doit etre place dans le meme dossier que app.py.
+#
+# segmentation/
+# |-- app.py
+# |-- evaluation_segmentation.py
+# |-- requirements.txt
+# |-- models/
+#
+# UTILISATION SUR GRID'5000
+# ---------------------------------------------------------------------
+#
+# 1. Effectuer une reservation interactive sur un noeud GPU.
+#
+# 2. Activer l'environnement Python :
+#
+#   source ~/miniconda3/etc/profile.d/conda.sh
+#   conda activate eyevision
+#
+# 3. Se placer dans le dossier de segmentation :
+#
+#   cd ~/Bureau/segmentation/segmenter/segmentation
+#
+# 4. Executer le programme :
+#
+#   python3 evaluation_segmentation.py \
+#       ~/Bureau/videos \
+#       ~/Bureau/resultats_segmentation \
+#       --heures 12 \
+#       --marge 10
+#
+# ARGUMENTS
+# ---------------------------------------------------------------------
+#
+# source_dir : dossier contenant les videos originales.
+# output_dir : dossier de sauvegarde des resultats.
+# --heures   : temps de calcul restant, en heures (defaut : 12).
+# --marge    : marge de securite, en minutes (defaut : 10).
+#
+# RESULTATS
+# ---------------------------------------------------------------------
+#
+# resultats_segmentation.csv :
+#   Statistiques globales de segmentation pour chaque video.
+#
+# etat_avancement.json :
+#   Etat d'avancement permettant la reprise automatique.
+#
+# erreurs_segmentation.csv :
+#   Liste des erreurs rencontrees pendant le traitement.
+#
+# qualite_segmentation.csv :
+#   Resultats detailles de l'evaluation de chaque frame.
+#
+# REPRISE AUTOMATIQUE
+# ---------------------------------------------------------------------
+#
+# En cas d'interruption, relancer la meme commande avec les memes
+# dossiers d'entree et de sortie.
+#
+# Les videos entierement traitees sont ignorees.
+# Les segmentations terminees sont conservees.
+# Les segmentations interrompues sont recommencees.
+# Les evaluations interrompues sont recommencees sans segmenter
+# de nouveau la video.
+#
+# Ne pas supprimer le fichier etat_avancement.json.
+# Utiliser un espace de stockage persistant entre les reservations.
+#
+# LIMITES
+# ---------------------------------------------------------------------
+#
+# L'evaluation repose sur des regles heuristiques dont les seuils
+# doivent etre calibres sur des frames annotees manuellement.
+#
+# La reprise s'effectue au niveau des videos et des etapes,
+# et non au niveau de chaque frame.
+#
+# Le temps de segmentation exclut le temps d'evaluation ainsi
+# que les tentatives de segmentation interrompues.
+#
+# La progression exacte de la segmentation en nombre de frames
+# necessite un affichage de progression dans app.py.
+#
+# =====================================================================
+
+
+# =====================================================================
+# 1. IMPORTATION DES BIBLIOTHEQUES
+# =====================================================================
+
 import cv2
 import numpy as np
 import pandas as pd
-import subprocess
+
 import argparse
+import subprocess
 import time
-import sys
+import signal
+import json
 import csv
+import sys
+import os
+import shutil
+import fcntl
 
 from pathlib import Path
 from collections import deque, Counter
+from tqdm import tqdm
 
 
-# ============================================================
-# 1. PARAMETRES GENERAUX
-# ============================================================
+# =====================================================================
+# 2. PARAMETRES GENERAUX
+# =====================================================================
 
 PIPELINE_DIR = Path(__file__).resolve().parent
 
@@ -28,13 +167,23 @@ VIDEO_EXTENSIONS = {
     ".mkv"
 }
 
-# Couleurs BGR observees sur la video segmentee
+DUREE_RESERVATION_HEURES = 12
+
+MARGE_SECURITE_MINUTES = 10
+
+
+# =====================================================================
+# 3. COULEURS DES REGIONS ANATOMIQUES
+# =====================================================================
+
+# Couleurs BGR observees sur l'image segmentee de reference.
+
 COLORS_BGR = {
-    1: (97, 254, 0),     # Vert : Yeux
-    2: (99, 0, 252),     # Rose : Nez et bouche
-    3: (94, 254, 253),   # Jaune : Visage
-    4: (0, 0, 250),     # Rouge : Corps
-    5: (96, 0, 0)       # Bleu : Reste de la tete
+    1: (97, 254, 0),      # Vert : Yeux
+    2: (99, 0, 252),      # Rose : Nez et bouche
+    3: (94, 254, 253),    # Jaune : Visage
+    4: (0, 0, 250),       # Rouge : Corps
+    5: (96, 0, 0)         # Bleu : Reste de la tete
 }
 
 ZONES = {
@@ -46,44 +195,43 @@ ZONES = {
 }
 
 
-# ============================================================
-# 2. PARAMETRES DE VALIDATION
-# ============================================================
+# =====================================================================
+# 4. PARAMETRES DE VALIDATION DE LA SEGMENTATION
+# =====================================================================
 
-# Tolerance pour tenir compte de la compression video
+# Tolerance liee a la compression video
 TOLERANCE_COULEUR = 25
 
-# Nombre minimum de pixels par region
+# Nombre minimum de pixels pour considerer une region presente
 MIN_PIXELS_ZONE = 20
 
 # Surface segmentee minimale : 0.5 % de la frame
 MIN_SURFACE_SEGMENTEE = 0.005
 
 # Proportions minimales et maximales des regions
-# par rapport a la surface totale segmentee
+# relativement a la surface totale segmentee
 PROPORTIONS = {
-    1: (0.02, 0.16),  # Yeux
-    2: (0.02, 0.20),  # Nez et bouche
-    3: (0.05, 0.40),  # Visage
-    4: (0.20, 0.85),  # Corps
-    5: (0.01, 0.35)   # Reste de la tete
+    1: (0.02, 0.16),   # Yeux
+    2: (0.02, 0.20),   # Nez et bouche
+    3: (0.05, 0.40),   # Visage
+    4: (0.20, 0.85),   # Corps
+    5: (0.01, 0.35)    # Reste de la tete
 }
 
-# Comparaison des surfaces anatomiques
+# Comparaisons des surfaces
 COMPARAISONS_SURFACES = [
-    (1, 3),  # Yeux < Visage
-    (1, 4),  # Yeux < Corps
-    (2, 3),  # Bouche_Nez < Visage
-    (2, 4),  # Bouche_Nez < Corps
-    (3, 4),  # Visage < Corps
-    (5, 4)   # Reste_tete < Corps
+    (1, 3),
+    (1, 4),
+    (2, 3),
+    (2, 4),
+    (3, 4),
+    (5, 4)
 ]
 
-# Proportion minimale de la zone devant appartenir
-# a sa plus grande composante connexe
+# Continuite geometrique
 MIN_CONTINUITE = 0.70
 
-# Tolerance spatiale horizontale
+# Tolerance spatiale
 TOLERANCE_POSITION = 0.30
 
 # Analyse temporelle
@@ -95,22 +243,39 @@ FACTEUR_VARIATION = 3.0
 
 SEUIL_VARIATION_ABSOLUE = 0.05
 
-# Activation des differents controles
+# Activation ou desactivation des controles
 ACTIVER_COMPARAISON_SURFACES = True
 ACTIVER_CONTROLE_SPATIAL = True
 ACTIVER_CONTROLE_GEOMETRIQUE = True
 ACTIVER_CONTROLE_TEMPOREL = True
 
 
-# ============================================================
-# 3. CONSTRUCTION DES INTERVALLES DE COULEURS
-# ============================================================
+# =====================================================================
+# 5. COLONNES DU FICHIER CSV FINAL
+# =====================================================================
+
+COLONNES_RESULTATS = [
+    "video",
+    "nombre_total_frames",
+    "pct_frames_correctement_segmentees",
+    "pct_frames_mal_segmentees",
+    "duree_video_secondes",
+    "duree_segmentation_secondes"
+]
+
+
+# =====================================================================
+# 6. INTERVALLES DE COULEURS
+# =====================================================================
 
 INTERVALLES_COULEURS = {}
 
 for code, couleur in COLORS_BGR.items():
 
-    couleur = np.array(couleur, dtype=np.int16)
+    couleur = np.array(
+        couleur,
+        dtype=np.int16
+    )
 
     borne_inf = np.clip(
         couleur - TOLERANCE_COULEUR,
@@ -130,11 +295,172 @@ for code, couleur in COLORS_BGR.items():
     )
 
 
-# ============================================================
-# 4. INFORMATIONS SUR LA VIDEO ORIGINALE
-# ============================================================
+# =====================================================================
+# 7. GESTION DES INTERRUPTIONS
+# =====================================================================
 
-def informations_video(video_path):
+class FinReservation(Exception):
+    pass
+
+
+ARRET_DEMANDE = False
+
+
+def interruption(signum, frame):
+
+    global ARRET_DEMANDE
+
+    ARRET_DEMANDE = True
+
+
+signal.signal(signal.SIGTERM, interruption)
+
+signal.signal(signal.SIGINT, interruption)
+
+signal.signal(signal.SIGHUP, interruption)
+
+
+def verifier_temps(deadline):
+
+    if ARRET_DEMANDE:
+
+        raise FinReservation(
+            "Interruption demandee."
+        )
+
+    if time.monotonic() >= deadline:
+
+        raise FinReservation(
+            "Fin du temps de calcul disponible."
+        )
+
+
+# =====================================================================
+# 8. SAUVEGARDE ET CHARGEMENT DE L'ETAT
+# =====================================================================
+
+def sauvegarder_etat(etat, fichier_etat):
+
+    fichier_temporaire = (
+        fichier_etat.with_suffix(".tmp")
+    )
+
+    with open(
+        fichier_temporaire,
+        "w",
+        encoding="utf-8"
+    ) as fichier:
+
+        json.dump(
+            etat,
+            fichier,
+            indent=4,
+            ensure_ascii=False
+        )
+
+        fichier.flush()
+
+        os.fsync(fichier.fileno())
+
+    os.replace(
+        fichier_temporaire,
+        fichier_etat
+    )
+
+
+def charger_etat(fichier_etat):
+
+    if fichier_etat.exists():
+
+        with open(
+            fichier_etat,
+            "r",
+            encoding="utf-8"
+        ) as fichier:
+
+            return json.load(fichier)
+
+    return {}
+
+
+# =====================================================================
+# 9. EXPORTATION DES RESULTATS
+# =====================================================================
+
+def exporter_resultats(etat, fichier_resultats):
+
+    resultats = []
+
+    for information in etat.values():
+
+        if information.get("statut") == "terminee":
+
+            resultats.append(
+                information["resultat"]
+            )
+
+    df = pd.DataFrame(
+        resultats,
+        columns=COLONNES_RESULTATS
+    )
+
+    fichier_temporaire = (
+        fichier_resultats.with_suffix(".tmp")
+    )
+
+    df.to_csv(
+        fichier_temporaire,
+        index=False,
+        float_format="%.2f"
+    )
+
+    os.replace(
+        fichier_temporaire,
+        fichier_resultats
+    )
+
+
+def exporter_erreurs(etat, fichier_erreurs):
+
+    erreurs = []
+
+    for video, information in etat.items():
+
+        if information.get("erreur"):
+
+            erreurs.append({
+                "video": video,
+                "statut": information.get("statut"),
+                "erreur": information["erreur"]
+            })
+
+    fichier_temporaire = (
+        fichier_erreurs.with_suffix(".tmp")
+    )
+
+    pd.DataFrame(
+        erreurs,
+        columns=[
+            "video",
+            "statut",
+            "erreur"
+        ]
+    ).to_csv(
+        fichier_temporaire,
+        index=False
+    )
+
+    os.replace(
+        fichier_temporaire,
+        fichier_erreurs
+    )
+
+
+# =====================================================================
+# 10. INFORMATIONS SUR LA VIDEO ORIGINALE
+# =====================================================================
+
+def informations_video(video_path, deadline):
 
     cap = cv2.VideoCapture(str(video_path))
 
@@ -144,35 +470,65 @@ def informations_video(video_path):
             f"Impossible d'ouvrir : {video_path}"
         )
 
+    fps = cap.get(cv2.CAP_PROP_FPS)
+
+    total_estime = int(
+        cap.get(cv2.CAP_PROP_FRAME_COUNT)
+    )
+
+    nombre_frames = 0
+
     try:
 
-        fps = cap.get(cv2.CAP_PROP_FPS)
+        with tqdm(
+            total=total_estime or None,
+            desc="Lecture video originale",
+            unit="frame",
+            position=1,
+            leave=False,
+            dynamic_ncols=True
+        ) as barre:
 
-        nombre_frames = 0
+            while True:
 
-        # Comptage des frames effectivement lisibles
-        while cap.grab():
+                verifier_temps(deadline)
 
-            nombre_frames += 1
+                if not cap.grab():
 
-        if fps <= 0 or nombre_frames == 0:
+                    break
 
-            raise RuntimeError(
-                "Nombre de frames ou FPS invalide."
-            )
+                nombre_frames += 1
 
-        duree_video = nombre_frames / fps
-
-        return nombre_frames, fps, duree_video
+                barre.update(1)
 
     finally:
 
         cap.release()
 
+    if not np.isfinite(fps) or fps <= 0:
 
-# ============================================================
-# 5. EXTRACTION DES CARACTERISTIQUES DES REGIONS
-# ============================================================
+        raise RuntimeError(
+            "Frequence d'images invalide."
+        )
+
+    if nombre_frames == 0:
+
+        raise RuntimeError(
+            "Aucune frame lisible."
+        )
+
+    duree_video = nombre_frames / fps
+
+    return (
+        nombre_frames,
+        fps,
+        duree_video
+    )
+
+
+# =====================================================================
+# 11. EXTRACTION DES REGIONS ANATOMIQUES
+# =====================================================================
 
 def extraire_regions(frame):
 
@@ -201,7 +557,7 @@ def extraire_regions(frame):
 
             continue
 
-        # Calcul du centre de gravite
+        # Centre de gravite
         moments = cv2.moments(
             masque,
             binaryImage=True
@@ -219,48 +575,50 @@ def extraire_regions(frame):
 
             centre = None
 
-        # Recherche des composantes connexes
-        nombre, labels, stats, centroids = (
-            cv2.connectedComponentsWithStats(
-                masque,
-                connectivity=8
-            )
-        )
+        # Continuite geometrique
+        continuite = 0.0
 
-        if nombre > 1:
+        if ACTIVER_CONTROLE_GEOMETRIQUE:
 
-            plus_grande_surface = int(
-                np.max(
-                    stats[1:, cv2.CC_STAT_AREA]
+            nombre, labels, stats, centroids = (
+                cv2.connectedComponentsWithStats(
+                    masque,
+                    connectivity=8
                 )
             )
 
-            continuite = (
-                plus_grande_surface / surface
-            )
+            if nombre > 1:
 
-        else:
+                plus_grande_surface = int(
+                    np.max(
+                        stats[1:, cv2.CC_STAT_AREA]
+                    )
+                )
 
-            continuite = 0.0
+                continuite = (
+                    plus_grande_surface / surface
+                )
 
-        # Rectangle englobant la region
-        x, y, largeur, hauteur = cv2.boundingRect(
-            masque
-        )
+        # Rectangle englobant
+        bbox = cv2.boundingRect(masque)
 
         regions[code] = {
+
             "surface": surface,
+
             "centre": centre,
+
             "continuite": continuite,
-            "bbox": (x, y, largeur, hauteur)
+
+            "bbox": bbox
         }
 
     return regions
 
 
-# ============================================================
-# 6. CONTROLE DE LA QUALITE D'UNE FRAME
-# ============================================================
+# =====================================================================
+# 12. EVALUATION DE LA QUALITE D'UNE FRAME
+# =====================================================================
 
 def evaluer_frame(frame, historique):
 
@@ -269,7 +627,9 @@ def evaluer_frame(frame, historique):
     erreurs = []
 
     surfaces = {
+
         code: region["surface"]
+
         for code, region in regions.items()
     }
 
@@ -280,20 +640,25 @@ def evaluer_frame(frame, historique):
     )
 
     proportions = {
+
         code: (
             surface / surface_totale
-            if surface_totale > 0 else 0.0
+            if surface_totale > 0
+            else 0.0
         )
+
         for code, surface in surfaces.items()
     }
 
-    # --------------------------------------------------------
-    # CRITERE 1 : Absence de segmentation
-    # --------------------------------------------------------
+    # -----------------------------------------------------------------
+    # CRITERE 1 : ABSENCE DE SEGMENTATION
+    # -----------------------------------------------------------------
 
     if surface_totale == 0:
 
-        erreurs.append("Absence_segmentation")
+        erreurs.append(
+            "Absence_segmentation"
+        )
 
         return (
             False,
@@ -302,7 +667,6 @@ def evaluer_frame(frame, historique):
             proportions
         )
 
-    # Surface totale insuffisante
     if (
         surface_totale / nombre_pixels_frame
         < MIN_SURFACE_SEGMENTEE
@@ -312,7 +676,6 @@ def evaluer_frame(frame, historique):
             "Surface_segmentee_insuffisante"
         )
 
-    # Verification de la presence des cinq regions
     for code, surface in surfaces.items():
 
         if surface == 0:
@@ -321,9 +684,9 @@ def evaluer_frame(frame, historique):
                 f"Region_absente_{ZONES[code]}"
             )
 
-    # --------------------------------------------------------
-    # CRITERE 2 : Proportions anatomiques
-    # --------------------------------------------------------
+    # -----------------------------------------------------------------
+    # CRITERE 2 : PROPORTIONS ANATOMIQUES
+    # -----------------------------------------------------------------
 
     for code, proportion in proportions.items():
 
@@ -341,9 +704,9 @@ def evaluer_frame(frame, historique):
                 f"Surface_excessive_{ZONES[code]}"
             )
 
-    # --------------------------------------------------------
-    # CRITERE 3 : Comparaison entre les surfaces
-    # --------------------------------------------------------
+    # -----------------------------------------------------------------
+    # CRITERE 3 : COMPARAISON DES SURFACES
+    # -----------------------------------------------------------------
 
     if ACTIVER_COMPARAISON_SURFACES:
 
@@ -364,9 +727,9 @@ def evaluer_frame(frame, historique):
                     f"{ZONES[grande_zone]}"
                 )
 
-    # --------------------------------------------------------
-    # CRITERE 4 : Coherence spatiale
-    # --------------------------------------------------------
+    # -----------------------------------------------------------------
+    # CRITERE 4 : COHERENCE SPATIALE
+    # -----------------------------------------------------------------
 
     if ACTIVER_CONTROLE_SPATIAL:
 
@@ -414,8 +777,7 @@ def evaluer_frame(frame, historique):
                     "Position_yeux_anormale"
                 )
 
-        # Le nez et la bouche doivent etre
-        # au-dessus du corps
+        # Le nez et la bouche doivent etre au-dessus du corps
         if (
             centre_bouche is not None
             and centre_corps is not None
@@ -427,26 +789,22 @@ def evaluer_frame(frame, historique):
                     "Position_bouche_anormale"
                 )
 
-        # Alignement horizontal des zones du visage
-        if regions[3]["bbox"] is not None:
+        # Alignement horizontal des regions du visage
+        if (
+            regions[3]["bbox"] is not None
+            and centre_visage is not None
+        ):
 
-            x, y, largeur_visage, hauteur_visage = (
-                regions[3]["bbox"]
-            )
+            x, y, largeur, hauteur = regions[3]["bbox"]
 
             tolerance_x = (
-                largeur_visage
-                * TOLERANCE_POSITION
+                largeur * TOLERANCE_POSITION
             )
 
-            if (
-                centre_yeux is not None
-                and centre_visage is not None
-            ):
+            if centre_yeux is not None:
 
                 distance_x = abs(
-                    centre_yeux[0]
-                    - centre_visage[0]
+                    centre_yeux[0] - centre_visage[0]
                 )
 
                 if distance_x > tolerance_x:
@@ -455,14 +813,10 @@ def evaluer_frame(frame, historique):
                         "Mauvais_alignement_yeux"
                     )
 
-            if (
-                centre_bouche is not None
-                and centre_visage is not None
-            ):
+            if centre_bouche is not None:
 
                 distance_x = abs(
-                    centre_bouche[0]
-                    - centre_visage[0]
+                    centre_bouche[0] - centre_visage[0]
                 )
 
                 if distance_x > tolerance_x:
@@ -471,9 +825,9 @@ def evaluer_frame(frame, historique):
                         "Mauvais_alignement_bouche"
                     )
 
-    # --------------------------------------------------------
-    # CRITERE 5 : Coherence geometrique
-    # --------------------------------------------------------
+    # -----------------------------------------------------------------
+    # CRITERE 5 : COHERENCE GEOMETRIQUE
+    # -----------------------------------------------------------------
 
     if ACTIVER_CONTROLE_GEOMETRIQUE:
 
@@ -483,28 +837,26 @@ def evaluer_frame(frame, historique):
 
                 continue
 
-            seuil_continuite = MIN_CONTINUITE
+            seuil = MIN_CONTINUITE
 
-            # Les yeux peuvent former deux composantes
-            # connexes anatomiquement distinctes
+            # Les yeux peuvent former deux composantes distinctes
             if code == 1:
 
-                seuil_continuite = 0.40
+                seuil = 0.40
 
-            if region["continuite"] < seuil_continuite:
+            if region["continuite"] < seuil:
 
                 erreurs.append(
                     f"Fragmentation_{ZONES[code]}"
                 )
 
-    # --------------------------------------------------------
-    # CRITERE 6 : Coherence temporelle
-    # --------------------------------------------------------
+    # -----------------------------------------------------------------
+    # CRITERE 6 : COHERENCE TEMPORELLE
+    # -----------------------------------------------------------------
 
-    # On compare uniquement les frames ayant passe
-    # les controles precedents.
-
-    valide_structurellement = len(erreurs) == 0
+    valide_structurellement = (
+        len(erreurs) == 0
+    )
 
     if (
         ACTIVER_CONTROLE_TEMPOREL
@@ -519,7 +871,9 @@ def evaluer_frame(frame, historique):
 
                 continue
 
-            mediane = float(np.median(valeurs))
+            mediane = float(
+                np.median(valeurs)
+            )
 
             if mediane <= 0:
 
@@ -543,23 +897,17 @@ def evaluer_frame(frame, historique):
             ):
 
                 erreurs.append(
-                    f"Variation_temporelle_"
-                    f"{ZONES[code]}"
+                    f"Variation_temporelle_{ZONES[code]}"
                 )
 
-    # Actualisation de l'historique avec les frames
-    # structurellement valides, afin de permettre
-    # l'adaptation aux changements de position durables.
-
+    # Mise a jour de l'historique temporel
     if valide_structurellement:
 
         for code, proportion in proportions.items():
 
-            historique[code].append(proportion)
-
-    # --------------------------------------------------------
-    # RESULTAT FINAL
-    # --------------------------------------------------------
+            historique[code].append(
+                proportion
+            )
 
     correcte = len(erreurs) == 0
 
@@ -571,17 +919,16 @@ def evaluer_frame(frame, historique):
     )
 
 
-# ============================================================
-# 7. EVALUATION DE LA VIDEO SEGMENTEE
-# ============================================================
+# =====================================================================
+# 13. EVALUATION COMPLETE D'UNE VIDEO SEGMENTEE
+# =====================================================================
 
-def evaluer_video(video_path, fichier_detail):
-
-    print("\n" + "=" * 65)
-
-    print(f"EVALUATION : {video_path.name}")
-
-    print("=" * 65)
+def evaluer_video(
+    video_path,
+    fichier_detail,
+    nombre_total_frames,
+    deadline
+):
 
     cap = cv2.VideoCapture(str(video_path))
 
@@ -600,7 +947,11 @@ def evaluer_video(video_path, fichier_detail):
     raisons_erreurs = Counter()
 
     historique = {
-        code: deque(maxlen=FENETRE_TEMPORELLE)
+
+        code: deque(
+            maxlen=FENETRE_TEMPORELLE
+        )
+
         for code in ZONES
     }
 
@@ -618,10 +969,14 @@ def evaluer_video(video_path, fichier_detail):
             f"continuite_{zone}"
         ])
 
+    fichier_temporaire = (
+        fichier_detail.with_suffix(".tmp")
+    )
+
     try:
 
         with open(
-            fichier_detail,
+            fichier_temporaire,
             "w",
             newline="",
             encoding="utf-8"
@@ -634,77 +989,99 @@ def evaluer_video(video_path, fichier_detail):
 
             writer.writeheader()
 
-            while True:
+            with tqdm(
+                total=nombre_total_frames,
+                desc="Evaluation qualite",
+                unit="frame",
+                position=1,
+                leave=False,
+                dynamic_ncols=True
+            ) as barre:
 
-                ret, frame = cap.read()
+                while True:
 
-                if not ret:
+                    verifier_temps(deadline)
 
-                    break
+                    ret, frame = cap.read()
 
-                (
-                    correcte,
-                    erreurs,
-                    regions,
-                    proportions
-                ) = evaluer_frame(
-                    frame,
-                    historique
-                )
+                    if not ret:
 
-                if correcte:
+                        break
 
-                    nombre_correctes += 1
+                    (
+                        correcte,
+                        erreurs,
+                        regions,
+                        proportions
 
-                else:
-
-                    nombre_incorrectes += 1
-
-                    raisons_erreurs.update(erreurs)
-
-                ligne = {
-                    "Frame": nombre_frames,
-                    "qualite_segmentation": (
-                        "Correcte"
-                        if correcte
-                        else "Incorrecte"
-                    ),
-                    "raisons": (
-                        "OK"
-                        if correcte
-                        else " | ".join(erreurs)
-                    )
-                }
-
-                for code, zone in ZONES.items():
-
-                    ligne[f"pixels_{zone}"] = (
-                        regions[code]["surface"]
+                    ) = evaluer_frame(
+                        frame,
+                        historique
                     )
 
-                    ligne[f"pct_{zone}"] = round(
-                        proportions[code] * 100,
-                        2
-                    )
+                    if correcte:
 
-                    ligne[f"continuite_{zone}"] = round(
-                        regions[code]["continuite"]
-                        * 100,
-                        2
-                    )
+                        nombre_correctes += 1
 
-                writer.writerow(ligne)
+                    else:
 
-                nombre_frames += 1
+                        nombre_incorrectes += 1
 
-                if nombre_frames % 1000 == 0:
+                        raisons_erreurs.update(
+                            erreurs
+                        )
 
-                    print(
-                        f"\rFrames analysees : "
-                        f"{nombre_frames}",
-                        end="",
-                        flush=True
-                    )
+                    ligne = {
+
+                        "Frame": nombre_frames,
+
+                        "qualite_segmentation": (
+                            "Correcte"
+                            if correcte
+                            else "Incorrecte"
+                        ),
+
+                        "raisons": (
+                            "OK"
+                            if correcte
+                            else " | ".join(erreurs)
+                        )
+                    }
+
+                    for code, zone in ZONES.items():
+
+                        ligne[f"pixels_{zone}"] = (
+                            regions[code]["surface"]
+                        )
+
+                        ligne[f"pct_{zone}"] = round(
+                            proportions[code] * 100,
+                            2
+                        )
+
+                        ligne[f"continuite_{zone}"] = round(
+                            regions[code]["continuite"] * 100,
+                            2
+                        )
+
+                    writer.writerow(ligne)
+
+                    nombre_frames += 1
+
+                    barre.update(1)
+
+                    if nombre_frames % 100 == 0:
+
+                        barre.set_postfix(
+
+                            correctes=nombre_correctes,
+
+                            incorrectes=nombre_incorrectes
+                        )
+
+            fichier.flush()
+
+            os.fsync(fichier.fileno())
 
     finally:
 
@@ -713,22 +1090,43 @@ def evaluer_video(video_path, fichier_detail):
     if nombre_frames == 0:
 
         raise RuntimeError(
-            "Aucune frame lisible."
+            "Aucune frame segmentee lisible."
         )
 
-    print("\n")
+    if nombre_frames != nombre_total_frames:
 
-    print(f"Total frames : {nombre_frames}")
+        raise RuntimeError(
+            f"Nombre de frames different : "
+            f"originale={nombre_total_frames}, "
+            f"segmentee={nombre_frames}"
+        )
 
-    print(f"Frames correctes : {nombre_correctes}")
+    os.replace(
+        fichier_temporaire,
+        fichier_detail
+    )
 
-    print(f"Frames incorrectes : {nombre_incorrectes}")
+    tqdm.write(
+        f"Nombre de frames correctes : {nombre_correctes}"
+    )
 
-    print("\nPrincipales anomalies detectees :")
+    tqdm.write(
+        f"Nombre de frames incorrectes : {nombre_incorrectes}"
+    )
 
-    for raison, nombre in raisons_erreurs.most_common():
+    if raisons_erreurs:
 
-        print(f"  {raison} : {nombre}")
+        tqdm.write(
+            "\nPrincipales anomalies detectees :"
+        )
+
+        for raison, nombre in (
+            raisons_erreurs.most_common(10)
+        ):
+
+            tqdm.write(
+                f"  {raison} : {nombre}"
+            )
 
     return (
         nombre_frames,
@@ -737,50 +1135,137 @@ def evaluer_video(video_path, fichier_detail):
     )
 
 
-# ============================================================
-# 8. EXECUTION ET CHRONOMETRAGE DE LA SEGMENTATION
-# ============================================================
+# =====================================================================
+# 14. ARRET DU PROCESSUS DE SEGMENTATION
+# =====================================================================
 
-def segmenter_video(video_path, output_dir):
+def arreter_processus(processus):
+
+    if processus.poll() is not None:
+
+        return
+
+    try:
+
+        os.killpg(
+            processus.pid,
+            signal.SIGTERM
+        )
+
+        processus.wait(timeout=5)
+
+    except subprocess.TimeoutExpired:
+
+        try:
+
+            os.killpg(
+                processus.pid,
+                signal.SIGKILL
+            )
+
+        except ProcessLookupError:
+
+            pass
+
+        processus.wait()
+
+    except ProcessLookupError:
+
+        pass
+
+
+# =====================================================================
+# 15. SEGMENTATION ET CHRONOMETRAGE
+# =====================================================================
+
+def segmenter_video(
+    video_path,
+    output_dir,
+    deadline
+):
+
+    verifier_temps(deadline)
 
     commande = [
         sys.executable,
+        "-u",
         str(APP_FILE),
         str(video_path),
         str(output_dir)
     ]
 
-    print("\n" + "=" * 65)
-
-    print(f"SEGMENTATION : {video_path.name}")
-
-    print("=" * 65)
+    tqdm.write(
+        f"\nSegmentation : {video_path.name}"
+    )
 
     debut = time.perf_counter()
 
-    subprocess.run(
+    processus = subprocess.Popen(
         commande,
         cwd=PIPELINE_DIR,
-        check=True
+        start_new_session=True
     )
 
-    fin = time.perf_counter()
+    try:
 
-    duree_segmentation = fin - debut
+        with tqdm(
+            desc="Temps de segmentation",
+            unit="s",
+            position=1,
+            leave=False,
+            dynamic_ncols=True,
+            bar_format=(
+                "{desc} : {elapsed} "
+                "| {n_fmt} secondes"
+            )
+        ) as barre:
 
-    print(
-        f"\nDuree de segmentation : "
-        f"{duree_segmentation:.2f} secondes"
+            precedent = 0
+
+            while processus.poll() is None:
+
+                verifier_temps(deadline)
+
+                temps_ecoule = int(
+                    time.perf_counter() - debut
+                )
+
+                barre.update(
+                    temps_ecoule - precedent
+                )
+
+                precedent = temps_ecoule
+
+                time.sleep(1)
+
+        if processus.returncode != 0:
+
+            raise RuntimeError(
+                f"Echec de app.py : "
+                f"code {processus.returncode}"
+            )
+
+    finally:
+
+        arreter_processus(processus)
+
+    duree = time.perf_counter() - debut
+
+    tqdm.write(
+        f"Segmentation terminee en {duree:.2f} secondes"
     )
 
-    return duree_segmentation
+    return duree
 
 
-# ============================================================
-# 9. RECHERCHE DE LA VIDEO SEGMENTEE
-# ============================================================
+# =====================================================================
+# 16. RECHERCHE DE LA VIDEO SEGMENTEE
+# =====================================================================
 
-def trouver_video_segmentee(video_path, output_dir):
+def trouver_video_segmentee(
+    video_path,
+    output_dir
+):
 
     fichier_attendu = (
         output_dir / f"seg_{video_path.name}"
@@ -809,104 +1294,239 @@ def trouver_video_segmentee(video_path, output_dir):
         return fichiers[0]
 
     raise FileNotFoundError(
-        f"Video segmentee introuvable "
-        f"ou ambigue : {video_path.name}"
+        f"Video segmentee introuvable ou ambigue : "
+        f"{video_path.name}"
     )
 
 
-# ============================================================
-# 10. ANALYSE COMPLETE D'UNE VIDEO
-# ============================================================
+# =====================================================================
+# 17. TRAITEMENT COMPLET D'UNE VIDEO
+# =====================================================================
 
-def analyser_video(
+def traiter_video(
     video_path,
+    source_dir,
     output_dir,
-    source_dir
+    etat,
+    fichier_etat,
+    fichier_resultats,
+    deadline
 ):
 
-    output_dir.mkdir(
+    identifiant = str(
+        video_path.relative_to(source_dir)
+    )
+
+    dossier_video = (
+        output_dir
+        / "videos"
+        / identifiant
+    )
+
+    dossier_segmentation = (
+        dossier_video / "segmentation"
+    )
+
+    dossier_video.mkdir(
         parents=True,
         exist_ok=True
     )
 
-    # Informations sur la video originale
-    (
-        nombre_frames_originales,
-        fps,
-        duree_video
-    ) = informations_video(video_path)
-
-    print(
-        f"\nNombre de frames : "
-        f"{nombre_frames_originales}"
+    information = etat.setdefault(
+        identifiant,
+        {"statut": "en_attente"}
     )
 
-    print(f"FPS : {fps:.2f}")
-
-    print(
-        f"Duree video : "
-        f"{duree_video:.2f} secondes"
+    sauvegarder_etat(
+        etat,
+        fichier_etat
     )
 
-    # Segmentation
-    duree_segmentation = segmenter_video(
-        video_path,
-        output_dir
-    )
+    # -----------------------------------------------------------------
+    # ETAPE 1 : INFORMATIONS SUR LA VIDEO ORIGINALE
+    # -----------------------------------------------------------------
 
-    # Recherche de la video segmentee
-    video_segmentee = trouver_video_segmentee(
-        video_path,
-        output_dir
-    )
+    if "nombre_total_frames" not in information:
 
-    # Fichier de controle frame par frame
-    fichier_detail = (
-        output_dir
-        / f"qualite_{video_path.stem}.csv"
-    )
+        (
+            nombre_frames,
+            fps,
+            duree_video
 
-    # Evaluation de la segmentation
-    (
-        nombre_frames_segmentees,
-        nombre_correctes,
-        nombre_incorrectes
-    ) = evaluer_video(
-        video_segmentee,
-        fichier_detail
-    )
-
-    # Verification du nombre de frames
-    if nombre_frames_segmentees != nombre_frames_originales:
-
-        raise RuntimeError(
-            f"Nombre de frames different : "
-            f"originale={nombre_frames_originales}, "
-            f"segmentee={nombre_frames_segmentees}"
+        ) = informations_video(
+            video_path,
+            deadline
         )
 
-    # Calcul des pourcentages
+        information["nombre_total_frames"] = (
+            nombre_frames
+        )
+
+        information["fps"] = fps
+
+        information["duree_video_secondes"] = (
+            duree_video
+        )
+
+        sauvegarder_etat(
+            etat,
+            fichier_etat
+        )
+
+    tqdm.write(
+        f"Video : {identifiant}"
+    )
+
+    tqdm.write(
+        f"Nombre total de frames : "
+        f"{information['nombre_total_frames']}"
+    )
+
+    tqdm.write(
+        f"Duree video : "
+        f"{information['duree_video_secondes']:.2f} s"
+    )
+
+    # -----------------------------------------------------------------
+    # ETAPE 2 : VERIFICATION DE LA SEGMENTATION
+    # -----------------------------------------------------------------
+
+    segmentation_terminee = (
+        information.get("statut") in {
+            "segmentation_terminee",
+            "evaluation_en_cours"
+        }
+    )
+
+    if segmentation_terminee:
+
+        video_segmentee = Path(
+            information["video_segmentee"]
+        )
+
+        if not video_segmentee.is_file():
+
+            segmentation_terminee = False
+
+    # -----------------------------------------------------------------
+    # ETAPE 3 : SEGMENTATION
+    # -----------------------------------------------------------------
+
+    if not segmentation_terminee:
+
+        verifier_temps(deadline)
+
+        information["statut"] = (
+            "segmentation_en_cours"
+        )
+
+        sauvegarder_etat(
+            etat,
+            fichier_etat
+        )
+
+        # Supprimer uniquement les sorties partielles
+        # du dossier dedie a cette segmentation.
+
+        if dossier_segmentation.exists():
+
+            shutil.rmtree(
+                dossier_segmentation
+            )
+
+        dossier_segmentation.mkdir(
+            parents=True,
+            exist_ok=True
+        )
+
+        duree_segmentation = segmenter_video(
+            video_path,
+            dossier_segmentation,
+            deadline
+        )
+
+        video_segmentee = trouver_video_segmentee(
+            video_path,
+            dossier_segmentation
+        )
+
+        information["video_segmentee"] = str(
+            video_segmentee
+        )
+
+        information["duree_segmentation_secondes"] = (
+            duree_segmentation
+        )
+
+        information["statut"] = (
+            "segmentation_terminee"
+        )
+
+        sauvegarder_etat(
+            etat,
+            fichier_etat
+        )
+
+    else:
+
+        tqdm.write(
+            "Segmentation deja terminee."
+        )
+
+        tqdm.write(
+            "Passage direct a l'evaluation."
+        )
+
+    # -----------------------------------------------------------------
+    # ETAPE 4 : EVALUATION DE LA QUALITE
+    # -----------------------------------------------------------------
+
+    verifier_temps(deadline)
+
+    information["statut"] = (
+        "evaluation_en_cours"
+    )
+
+    sauvegarder_etat(
+        etat,
+        fichier_etat
+    )
+
+    fichier_detail = (
+        dossier_video
+        / "qualite_segmentation.csv"
+    )
+
+    (
+        nombre_frames,
+        nombre_correctes,
+        nombre_incorrectes
+
+    ) = evaluer_video(
+        video_segmentee,
+        fichier_detail,
+        information["nombre_total_frames"],
+        deadline
+    )
+
+    # -----------------------------------------------------------------
+    # ETAPE 5 : CALCUL DES STATISTIQUES
+    # -----------------------------------------------------------------
+
     pct_correctes = (
-        nombre_correctes
-        / nombre_frames_originales
-        * 100
+        nombre_correctes / nombre_frames * 100
     )
 
     pct_incorrectes = (
-        nombre_incorrectes
-        / nombre_frames_originales
-        * 100
+        nombre_incorrectes / nombre_frames * 100
     )
 
-    # Construction du resultat final
     resultat = {
 
-        "video": str(
-            video_path.relative_to(source_dir)
-        ),
+        "video": identifiant,
 
         "nombre_total_frames":
-            nombre_frames_originales,
+            nombre_frames,
 
         "pct_frames_correctement_segmentees":
             round(pct_correctes, 2),
@@ -915,90 +1535,121 @@ def analyser_video(
             round(pct_incorrectes, 2),
 
         "duree_video_secondes":
-            round(duree_video, 2),
+            round(
+                information["duree_video_secondes"],
+                2
+            ),
 
         "duree_segmentation_secondes":
-            round(duree_segmentation, 2)
+            round(
+                information["duree_segmentation_secondes"],
+                2
+            )
     }
 
-    return resultat
+    # -----------------------------------------------------------------
+    # ETAPE 6 : SAUVEGARDE DES RESULTATS
+    # -----------------------------------------------------------------
 
+    information["resultat"] = resultat
 
-# ============================================================
-# 11. PROGRAMME PRINCIPAL
-# ============================================================
+    information["statut"] = "terminee"
 
-def main():
+    information.pop("erreur", None)
 
-    parser = argparse.ArgumentParser(
-        description=(
-            "Segmentation automatique et evaluation "
-            "de la qualite de segmentation"
-        )
+    sauvegarder_etat(
+        etat,
+        fichier_etat
     )
 
-    parser.add_argument(
-        "source_dir",
-        help="Dossier contenant les videos originales"
+    exporter_resultats(
+        etat,
+        fichier_resultats
     )
 
-    parser.add_argument(
-        "output_dir",
-        help="Dossier de sortie des resultats"
+    tqdm.write(
+        f"\nVideo terminee : {identifiant}"
     )
 
-    args = parser.parse_args()
+    tqdm.write(
+        f"Frames correctement segmentees : "
+        f"{pct_correctes:.2f} %"
+    )
 
-    source_dir = Path(
-        args.source_dir
-    ).resolve()
+    tqdm.write(
+        f"Frames mal segmentees : "
+        f"{pct_incorrectes:.2f} %"
+    )
 
-    output_dir = Path(
-        args.output_dir
-    ).resolve()
+    tqdm.write(
+        f"Duree segmentation : "
+        f"{information['duree_segmentation_secondes']:.2f} s"
+    )
 
-    if not source_dir.is_dir():
 
-        raise NotADirectoryError(source_dir)
+# =====================================================================
+# 18. GESTION DU PIPELINE GLOBAL
+# =====================================================================
 
-    if not APP_FILE.is_file():
+def executer_pipeline(
+    source_dir,
+    output_dir,
+    temps_disponible
+):
 
-        raise FileNotFoundError(APP_FILE)
+    debut_execution = time.monotonic()
 
-    if (
-        source_dir == output_dir
-        or source_dir.is_relative_to(output_dir)
-    ):
+    deadline = (
+        debut_execution + temps_disponible
+    )
 
-        raise ValueError(
-            "Le dossier de sortie ne doit pas "
-            "contenir le dossier source."
-        )
-
-    output_dir.mkdir(
-        parents=True,
-        exist_ok=True
+    fichier_etat = (
+        output_dir / "etat_avancement.json"
     )
 
     fichier_resultats = (
-        output_dir
-        / "resultats_segmentation.csv"
+        output_dir / "resultats_segmentation.csv"
     )
 
     fichier_erreurs = (
-        output_dir
-        / "erreurs_segmentation.csv"
+        output_dir / "erreurs_segmentation.csv"
     )
 
-    # Evite d'ecraser les resultats d'une ancienne execution
-    if (
-        fichier_resultats.exists()
-        or fichier_erreurs.exists()
-    ):
+    # Chargement des traitements precedents
+    etat = charger_etat(fichier_etat)
 
-        raise FileExistsError(
-            "Des resultats existent deja. "
-            "Choisir un nouveau dossier de sortie."
+    # Verification du dossier source
+    fichier_source = (
+        output_dir / "source.txt"
+    )
+
+    if fichier_source.exists():
+
+        ancienne_source = (
+            fichier_source.read_text(
+                encoding="utf-8"
+            ).strip()
+        )
+
+        if ancienne_source != str(source_dir):
+
+            raise ValueError(
+                "Le dossier de sortie appartient "
+                "a un autre dossier source."
+            )
+
+    else:
+
+        if etat:
+
+            raise RuntimeError(
+                "Etat existant sans identification "
+                "du dossier source."
+            )
+
+        fichier_source.write_text(
+            str(source_dir),
+            encoding="utf-8"
         )
 
     # Recherche recursive des videos
@@ -1024,134 +1675,420 @@ def main():
 
         return
 
-    print("\n" + "=" * 65)
+    identifiants = {
+
+        str(video.relative_to(source_dir))
+
+        for video in videos
+    }
+
+    if set(etat) - identifiants:
+
+        raise RuntimeError(
+            "Certaines videos deja enregistrees "
+            "ont disparu du dossier source."
+        )
+
+    # Initialisation et verification des videos sources
+    for video in videos:
+
+        identifiant = str(
+            video.relative_to(source_dir)
+        )
+
+        stat = video.stat()
+
+        empreinte = {
+            "taille": stat.st_size,
+            "modification_ns": stat.st_mtime_ns
+        }
+
+        information = etat.setdefault(
+            identifiant,
+            {"statut": "en_attente"}
+        )
+
+        ancienne_empreinte = (
+            information.get("source")
+        )
+
+        if (
+            ancienne_empreinte is not None
+            and ancienne_empreinte != empreinte
+        ):
+
+            raise RuntimeError(
+                f"Video originale modifiee : {video}"
+            )
+
+        information["source"] = empreinte
+
+    sauvegarder_etat(
+        etat,
+        fichier_etat
+    )
+
+    nombre_terminees = sum(
+
+        information.get("statut") == "terminee"
+
+        for information in etat.values()
+    )
+
+    print("\n" + "=" * 70)
 
     print("PIPELINE DE SEGMENTATION ET EVALUATION")
 
-    print("=" * 65)
+    print("=" * 70)
 
     print(
-        f"Nombre de videos trouvees : "
-        f"{len(videos)}"
+        f"Nombre total de videos : {len(videos)}"
     )
 
-    resultats = []
+    print(
+        f"Videos deja terminees : {nombre_terminees}"
+    )
 
-    erreurs = []
+    print(
+        f"Videos restantes : "
+        f"{len(videos) - nombre_terminees}"
+    )
 
-    debut_pipeline = time.perf_counter()
+    print(
+        f"Temps de calcul disponible : "
+        f"{temps_disponible / 3600:.2f} heures"
+    )
 
-    for i, video in enumerate(videos, start=1):
+    print("=" * 70 + "\n")
 
-        print("\n" + "#" * 65)
+    exporter_resultats(
+        etat,
+        fichier_resultats
+    )
 
-        print(f"VIDEO {i}/{len(videos)}")
+    exporter_erreurs(
+        etat,
+        fichier_erreurs
+    )
 
-        print(f"Nom : {video.name}")
+    try:
 
-        print("#" * 65)
+        with tqdm(
+            total=len(videos),
+            initial=nombre_terminees,
+            desc="Progression globale",
+            unit="video",
+            position=0,
+            leave=True,
+            dynamic_ncols=True
+        ) as barre_globale:
+
+            for video in videos:
+
+                verifier_temps(deadline)
+
+                identifiant = str(
+                    video.relative_to(source_dir)
+                )
+
+                information = etat[identifiant]
+
+                # Ignorer les videos entierement traitees
+                if information.get("statut") == "terminee":
+
+                    continue
+
+                temps_restant = max(
+                    0,
+                    deadline - time.monotonic()
+                )
+
+                barre_globale.set_postfix(
+
+                    video=video.name,
+
+                    restant_h=round(
+                        temps_restant / 3600,
+                        2
+                    )
+                )
+
+                try:
+
+                    traiter_video(
+                        video,
+                        source_dir,
+                        output_dir,
+                        etat,
+                        fichier_etat,
+                        fichier_resultats,
+                        deadline
+                    )
+
+                    barre_globale.update(1)
+
+                except FinReservation:
+
+                    raise
+
+                except Exception as erreur:
+
+                    tqdm.write(
+                        f"\nERREUR : {video.name}"
+                    )
+
+                    tqdm.write(
+                        str(erreur)
+                    )
+
+                    information["erreur"] = str(
+                        erreur
+                    )
+
+                    sauvegarder_etat(
+                        etat,
+                        fichier_etat
+                    )
+
+                    exporter_erreurs(
+                        etat,
+                        fichier_erreurs
+                    )
+
+    except FinReservation as erreur:
+
+        print(f"\n{erreur}")
+
+        print(
+            "Arret du traitement. "
+            "Les resultats sont conserves."
+        )
+
+    finally:
+
+        sauvegarder_etat(
+            etat,
+            fichier_etat
+        )
+
+        exporter_resultats(
+            etat,
+            fichier_resultats
+        )
+
+        exporter_erreurs(
+            etat,
+            fichier_erreurs
+        )
+
+        nombre_terminees = sum(
+
+            information.get("statut") == "terminee"
+
+            for information in etat.values()
+        )
+
+        nombre_erreurs = sum(
+
+            bool(information.get("erreur"))
+
+            for information in etat.values()
+        )
+
+        duree_execution = (
+            time.monotonic() - debut_execution
+        )
+
+        print("\n" + "=" * 70)
+
+        print("BILAN DE L'EXECUTION")
+
+        print("=" * 70)
+
+        print(
+            f"Videos terminees : "
+            f"{nombre_terminees}/{len(videos)}"
+        )
+
+        print(
+            f"Videos restantes : "
+            f"{len(videos) - nombre_terminees}"
+        )
+
+        print(
+            f"Videos avec erreur : {nombre_erreurs}"
+        )
+
+        print(
+            f"Temps de cette execution : "
+            f"{duree_execution / 3600:.2f} heures"
+        )
+
+        print(
+            f"\nResultats : {fichier_resultats}"
+        )
+
+        print(
+            f"Etat : {fichier_etat}"
+        )
+
+        print(
+            f"Erreurs : {fichier_erreurs}"
+        )
+
+        if nombre_terminees == len(videos):
+
+            print(
+                "\nToutes les videos ont ete traitees."
+            )
+
+        else:
+
+            print(
+                "\nRelancer la meme commande "
+                "pour poursuivre le traitement."
+            )
+
+        print("=" * 70)
+
+
+# =====================================================================
+# 19. PROGRAMME PRINCIPAL
+# =====================================================================
+
+def main():
+
+    parser = argparse.ArgumentParser(
+
+        description=(
+            "Segmentation automatique et evaluation "
+            "avec reprise sur Grid5000"
+        )
+    )
+
+    parser.add_argument(
+        "source_dir",
+        help="Dossier des videos originales"
+    )
+
+    parser.add_argument(
+        "output_dir",
+        help="Dossier des resultats"
+    )
+
+    parser.add_argument(
+        "--heures",
+        type=float,
+        default=DUREE_RESERVATION_HEURES,
+        help="Temps de calcul restant en heures"
+    )
+
+    parser.add_argument(
+        "--marge",
+        type=float,
+        default=MARGE_SECURITE_MINUTES,
+        help="Marge de securite en minutes"
+    )
+
+    args = parser.parse_args()
+
+    source_dir = Path(
+        args.source_dir
+    ).resolve()
+
+    output_dir = Path(
+        args.output_dir
+    ).resolve()
+
+    # Verification des dossiers
+    if not source_dir.is_dir():
+
+        raise NotADirectoryError(
+            source_dir
+        )
+
+    if not APP_FILE.is_file():
+
+        raise FileNotFoundError(
+            f"Programme introuvable : {APP_FILE}"
+        )
+
+    if source_dir.is_relative_to(output_dir):
+
+        raise ValueError(
+            "Le dossier de sortie ne doit pas "
+            "contenir le dossier source."
+        )
+
+    if (
+        not np.isfinite(args.heures)
+        or not np.isfinite(args.marge)
+        or args.heures <= 0
+        or args.marge < 0
+    ):
+
+        raise ValueError(
+            "Parametres de duree invalides."
+        )
+
+    # Calcul du temps disponible
+    temps_disponible = (
+        args.heures * 3600
+        - args.marge * 60
+    )
+
+    if temps_disponible <= 0:
+
+        raise ValueError(
+            "Temps de calcul disponible insuffisant."
+        )
+
+    output_dir.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    # Empecher deux executions simultanees
+    # sur le meme dossier de resultats.
+    fichier_verrou = (
+        output_dir / "execution.lock"
+    )
+
+    with open(fichier_verrou, "a+") as verrou:
 
         try:
 
-            # Un dossier de sortie par video
-            dossier_video = (
-                output_dir
-                / video.parent.relative_to(source_dir)
-                / video.name
+            fcntl.flock(
+                verrou,
+                fcntl.LOCK_EX | fcntl.LOCK_NB
             )
 
-            if (
-                dossier_video.exists()
-                and any(dossier_video.iterdir())
-            ):
+        except BlockingIOError:
 
-                raise FileExistsError(
-                    f"Dossier deja utilise : "
-                    f"{dossier_video}"
-                )
-
-            resultat = analyser_video(
-                video,
-                dossier_video,
-                source_dir
+            raise RuntimeError(
+                "Une autre execution utilise "
+                "deja ce dossier de resultats."
             )
 
-            resultats.append(resultat)
+        try:
 
-            # Sauvegarde apres chaque video
-            pd.DataFrame(resultats).to_csv(
-                fichier_resultats,
-                index=False,
-                float_format="%.2f"
+            executer_pipeline(
+                source_dir,
+                output_dir,
+                temps_disponible
             )
 
-            print("\nRESULTATS DE LA VIDEO")
+        finally:
 
-            for cle, valeur in resultat.items():
-
-                print(f"{cle} : {valeur}")
-
-        except Exception as e:
-
-            print(f"\nERREUR : {video.name}")
-
-            print(str(e))
-
-            erreurs.append({
-                "video": str(video),
-                "erreur": str(e)
-            })
-
-            pd.DataFrame(erreurs).to_csv(
-                fichier_erreurs,
-                index=False
+            fcntl.flock(
+                verrou,
+                fcntl.LOCK_UN
             )
 
-    fin_pipeline = time.perf_counter()
 
-    duree_pipeline = (
-        fin_pipeline - debut_pipeline
-    )
-
-    print("\n" + "=" * 65)
-
-    print("TRAITEMENT TERMINE")
-
-    print("=" * 65)
-
-    print(
-        f"Nombre de videos traitees : "
-        f"{len(resultats)}"
-    )
-
-    print(
-        f"Nombre de videos en echec : "
-        f"{len(erreurs)}"
-    )
-
-    print(
-        f"Duree totale du pipeline : "
-        f"{duree_pipeline:.2f} secondes"
-    )
-
-    if resultats:
-
-        print(
-            f"Fichier des resultats : "
-            f"{fichier_resultats}"
-        )
-
-    if erreurs:
-
-        print(
-            f"Fichier des erreurs : "
-            f"{fichier_erreurs}"
-        )
-
-
-# ============================================================
-# 12. EXECUTION
-# ============================================================
+# =====================================================================
+# 20. EXECUTION DU PROGRAMME
+# =====================================================================
 
 if __name__ == "__main__":
 
