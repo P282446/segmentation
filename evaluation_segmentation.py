@@ -1,135 +1,9 @@
-
 # -*- coding: utf-8 -*-
-
-# =====================================================================
-#          PIPELINE DE SEGMENTATION ET EVALUATION DE LA QUALITE
-# =====================================================================
-#
-# DESCRIPTION
-# ---------------------------------------------------------------------
-# Ce programme permet de segmenter automatiquement un ensemble de
-# videos et d'evaluer la qualite de leur segmentation.
-#
-# L'evaluation repose sur plusieurs criteres :
-#
-#   - Presence des couleurs caracteristiques de la segmentation ;
-#   - Proportions des cinq regions anatomiques ;
-#   - Comparaison des surfaces des regions ;
-#   - Coherence spatiale et geometrique ;
-#   - Coherence temporelle entre les frames successives.
-#
-# Le programme est adapte aux reservations de calcul sur Grid'5000.
-# Il sauvegarde son etat d'avancement et reprend automatiquement
-# les traitements restants apres une interruption.
-#
-# DEPENDANCES
-# ---------------------------------------------------------------------
-#
-# Bibliotheques Python externes :
-#
-#   - opencv-python
-#   - numpy
-#   - pandas
-#   - tqdm
-#
-# Installation :
-#
-#   python -m pip install opencv-python numpy pandas tqdm
-#
-# Les dependances de app.py doivent egalement etre installees.
-#
-# ORGANISATION
-# ---------------------------------------------------------------------
-#
-# Le programme doit etre place dans le meme dossier que app.py.
-#
-# segmentation/
-# |-- app.py
-# |-- evaluation_segmentation.py
-# |-- requirements.txt
-# |-- models/
-#
-# UTILISATION SUR GRID'5000
-# ---------------------------------------------------------------------
-#
-# 1. Effectuer une reservation interactive sur un noeud GPU.
-#
-# 2. Activer l'environnement Python :
-#
-#   source ~/miniconda3/etc/profile.d/conda.sh
-#   conda activate eyevision
-#
-# 3. Se placer dans le dossier de segmentation :
-#
-#   cd ~/Bureau/segmentation/segmenter/segmentation
-#
-# 4. Executer le programme :
-#
-#   python3 evaluation_segmentation.py \
-#       ~/Bureau/videos \
-#       ~/Bureau/resultats_segmentation \
-#       --heures 12 \
-#       --marge 10
-#
-# ARGUMENTS
-# ---------------------------------------------------------------------
-#
-# source_dir : dossier contenant les videos originales.
-# output_dir : dossier de sauvegarde des resultats.
-# --heures   : temps de calcul restant, en heures (defaut : 12).
-# --marge    : marge de securite, en minutes (defaut : 10).
-#
-# RESULTATS
-# ---------------------------------------------------------------------
-#
-# resultats_segmentation.csv :
-#   Statistiques globales de segmentation pour chaque video.
-#
-# etat_avancement.json :
-#   Etat d'avancement permettant la reprise automatique.
-#
-# erreurs_segmentation.csv :
-#   Liste des erreurs rencontrees pendant le traitement.
-#
-# qualite_segmentation.csv :
-#   Resultats detailles de l'evaluation de chaque frame.
-#
-# REPRISE AUTOMATIQUE
-# ---------------------------------------------------------------------
-#
-# En cas d'interruption, relancer la meme commande avec les memes
-# dossiers d'entree et de sortie.
-#
-# Les videos entierement traitees sont ignorees.
-# Les segmentations terminees sont conservees.
-# Les segmentations interrompues sont recommencees.
-# Les evaluations interrompues sont recommencees sans segmenter
-# de nouveau la video.
-#
-# Ne pas supprimer le fichier etat_avancement.json.
-# Utiliser un espace de stockage persistant entre les reservations.
-#
-# LIMITES
-# ---------------------------------------------------------------------
-#
-# L'evaluation repose sur des regles heuristiques dont les seuils
-# doivent etre calibres sur des frames annotees manuellement.
-#
-# La reprise s'effectue au niveau des videos et des etapes,
-# et non au niveau de chaque frame.
-#
-# Le temps de segmentation exclut le temps d'evaluation ainsi
-# que les tentatives de segmentation interrompues.
-#
-# La progression exacte de la segmentation en nombre de frames
-# necessite un affichage de progression dans app.py.
-#
-# =====================================================================
-
-
-# =====================================================================
-# 1. IMPORTATION DES BIBLIOTHEQUES
-# =====================================================================
+# Segmentation et evaluation globale avec reprise Grid5000.
+# Seul resultat public : resultats_segmentation.csv.
+# Les fichiers internes et sorties temporaires servent a la reprise.
+# Les sorties historiques ne sont pas effacees automatiquement.
+# Usage : python3 evaluation_segmentation.py SOURCE SORTIE --heures 12 --marge 10
 
 import cv2
 import numpy as np
@@ -140,14 +14,13 @@ import subprocess
 import time
 import signal
 import json
-import csv
 import sys
 import os
 import shutil
 import fcntl
 
 from pathlib import Path
-from collections import deque, Counter
+from collections import deque
 from tqdm import tqdm
 
 
@@ -420,40 +293,7 @@ def exporter_resultats(etat, fichier_resultats):
     )
 
 
-def exporter_erreurs(etat, fichier_erreurs):
 
-    erreurs = []
-
-    for video, information in etat.items():
-
-        if information.get("erreur"):
-
-            erreurs.append({
-                "video": video,
-                "statut": information.get("statut"),
-                "erreur": information["erreur"]
-            })
-
-    fichier_temporaire = (
-        fichier_erreurs.with_suffix(".tmp")
-    )
-
-    pd.DataFrame(
-        erreurs,
-        columns=[
-            "video",
-            "statut",
-            "erreur"
-        ]
-    ).to_csv(
-        fichier_temporaire,
-        index=False
-    )
-
-    os.replace(
-        fichier_temporaire,
-        fichier_erreurs
-    )
 
 
 # =====================================================================
@@ -461,69 +301,23 @@ def exporter_erreurs(etat, fichier_erreurs):
 # =====================================================================
 
 def informations_video(video_path, deadline):
-
     cap = cv2.VideoCapture(str(video_path))
-
     if not cap.isOpened():
-
-        raise RuntimeError(
-            f"Impossible d'ouvrir : {video_path}"
-        )
-
-    fps = cap.get(cv2.CAP_PROP_FPS)
-
-    total_estime = int(
-        cap.get(cv2.CAP_PROP_FRAME_COUNT)
-    )
-
-    nombre_frames = 0
-
+        raise RuntimeError(f"Impossible d'ouvrir : {video_path}")
     try:
-
-        with tqdm(
-            total=total_estime or None,
-            desc="Lecture video originale",
-            unit="frame",
-            position=1,
-            leave=False,
-            dynamic_ncols=True
-        ) as barre:
-
-            while True:
-
-                verifier_temps(deadline)
-
-                if not cap.grab():
-
-                    break
-
-                nombre_frames += 1
-
-                barre.update(1)
-
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        nombre_frames = 0
+        while True:
+            verifier_temps(deadline)
+            if not cap.grab():
+                break
+            nombre_frames += 1
     finally:
-
         cap.release()
+    if not np.isfinite(fps) or fps <= 0 or not nombre_frames:
+        raise RuntimeError("Video vide ou frequence invalide.")
+    return nombre_frames, fps, nombre_frames / fps
 
-    if not np.isfinite(fps) or fps <= 0:
-
-        raise RuntimeError(
-            "Frequence d'images invalide."
-        )
-
-    if nombre_frames == 0:
-
-        raise RuntimeError(
-            "Aucune frame lisible."
-        )
-
-    duree_video = nombre_frames / fps
-
-    return (
-        nombre_frames,
-        fps,
-        duree_video
-    )
 
 
 # =====================================================================
@@ -923,216 +717,27 @@ def evaluer_frame(frame, historique):
 # 13. EVALUATION COMPLETE D'UNE VIDEO SEGMENTEE
 # =====================================================================
 
-def evaluer_video(
-    video_path,
-    fichier_detail,
-    nombre_total_frames,
-    deadline
-):
-
+def evaluer_video(video_path, nombre_total_frames, deadline):
     cap = cv2.VideoCapture(str(video_path))
-
     if not cap.isOpened():
-
-        raise RuntimeError(
-            f"Impossible d'ouvrir : {video_path}"
-        )
-
-    nombre_frames = 0
-
-    nombre_correctes = 0
-
-    nombre_incorrectes = 0
-
-    raisons_erreurs = Counter()
-
-    historique = {
-
-        code: deque(
-            maxlen=FENETRE_TEMPORELLE
-        )
-
-        for code in ZONES
-    }
-
-    colonnes = [
-        "Frame",
-        "qualite_segmentation",
-        "raisons"
-    ]
-
-    for zone in ZONES.values():
-
-        colonnes.extend([
-            f"pixels_{zone}",
-            f"pct_{zone}",
-            f"continuite_{zone}"
-        ])
-
-    fichier_temporaire = (
-        fichier_detail.with_suffix(".tmp")
-    )
-
+        raise RuntimeError(f"Impossible d'ouvrir : {video_path}")
+    nombre_frames = nombre_correctes = 0
+    historique = {code: deque(maxlen=FENETRE_TEMPORELLE) for code in ZONES}
     try:
-
-        with open(
-            fichier_temporaire,
-            "w",
-            newline="",
-            encoding="utf-8"
-        ) as fichier:
-
-            writer = csv.DictWriter(
-                fichier,
-                fieldnames=colonnes
-            )
-
-            writer.writeheader()
-
-            with tqdm(
-                total=nombre_total_frames,
-                desc="Evaluation qualite",
-                unit="frame",
-                position=1,
-                leave=False,
-                dynamic_ncols=True
-            ) as barre:
-
-                while True:
-
-                    verifier_temps(deadline)
-
-                    ret, frame = cap.read()
-
-                    if not ret:
-
-                        break
-
-                    (
-                        correcte,
-                        erreurs,
-                        regions,
-                        proportions
-
-                    ) = evaluer_frame(
-                        frame,
-                        historique
-                    )
-
-                    if correcte:
-
-                        nombre_correctes += 1
-
-                    else:
-
-                        nombre_incorrectes += 1
-
-                        raisons_erreurs.update(
-                            erreurs
-                        )
-
-                    ligne = {
-
-                        "Frame": nombre_frames,
-
-                        "qualite_segmentation": (
-                            "Correcte"
-                            if correcte
-                            else "Incorrecte"
-                        ),
-
-                        "raisons": (
-                            "OK"
-                            if correcte
-                            else " | ".join(erreurs)
-                        )
-                    }
-
-                    for code, zone in ZONES.items():
-
-                        ligne[f"pixels_{zone}"] = (
-                            regions[code]["surface"]
-                        )
-
-                        ligne[f"pct_{zone}"] = round(
-                            proportions[code] * 100,
-                            2
-                        )
-
-                        ligne[f"continuite_{zone}"] = round(
-                            regions[code]["continuite"] * 100,
-                            2
-                        )
-
-                    writer.writerow(ligne)
-
-                    nombre_frames += 1
-
-                    barre.update(1)
-
-                    if nombre_frames % 100 == 0:
-
-                        barre.set_postfix(
-
-                            correctes=nombre_correctes,
-
-                            incorrectes=nombre_incorrectes
-                        )
-
-            fichier.flush()
-
-            os.fsync(fichier.fileno())
-
+        while True:
+            verifier_temps(deadline)
+            ret, frame = cap.read()
+            if not ret:
+                break
+            correcte, _, _, _ = evaluer_frame(frame, historique)
+            nombre_frames += 1
+            nombre_correctes += int(correcte)
     finally:
-
         cap.release()
+    if not nombre_frames or nombre_frames != nombre_total_frames:
+        raise RuntimeError(f"Nombre de frames different : originale={nombre_total_frames}, segmentee={nombre_frames}")
+    return nombre_frames, nombre_correctes, nombre_frames - nombre_correctes
 
-    if nombre_frames == 0:
-
-        raise RuntimeError(
-            "Aucune frame segmentee lisible."
-        )
-
-    if nombre_frames != nombre_total_frames:
-
-        raise RuntimeError(
-            f"Nombre de frames different : "
-            f"originale={nombre_total_frames}, "
-            f"segmentee={nombre_frames}"
-        )
-
-    os.replace(
-        fichier_temporaire,
-        fichier_detail
-    )
-
-    tqdm.write(
-        f"Nombre de frames correctes : {nombre_correctes}"
-    )
-
-    tqdm.write(
-        f"Nombre de frames incorrectes : {nombre_incorrectes}"
-    )
-
-    if raisons_erreurs:
-
-        tqdm.write(
-            "\nPrincipales anomalies detectees :"
-        )
-
-        for raison, nombre in (
-            raisons_erreurs.most_common(10)
-        ):
-
-            tqdm.write(
-                f"  {raison} : {nombre}"
-            )
-
-    return (
-        nombre_frames,
-        nombre_correctes,
-        nombre_incorrectes
-    )
 
 
 # =====================================================================
@@ -1178,84 +783,22 @@ def arreter_processus(processus):
 # 15. SEGMENTATION ET CHRONOMETRAGE
 # =====================================================================
 
-def segmenter_video(
-    video_path,
-    output_dir,
-    deadline
-):
-
+def segmenter_video(video_path, output_dir, deadline):
     verifier_temps(deadline)
-
-    commande = [
-        sys.executable,
-        "-u",
-        str(APP_FILE),
-        str(video_path),
-        str(output_dir)
-    ]
-
-    tqdm.write(
-        f"\nSegmentation : {video_path.name}"
-    )
-
+    commande = [sys.executable, "-u", str(APP_FILE), str(video_path), str(output_dir)]
     debut = time.perf_counter()
-
-    processus = subprocess.Popen(
-        commande,
-        cwd=PIPELINE_DIR,
-        start_new_session=True
-    )
-
+    processus = subprocess.Popen(commande, cwd=PIPELINE_DIR, start_new_session=True,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
-
-        with tqdm(
-            desc="Temps de segmentation",
-            unit="s",
-            position=1,
-            leave=False,
-            dynamic_ncols=True,
-            bar_format=(
-                "{desc} : {elapsed} "
-                "| {n_fmt} secondes"
-            )
-        ) as barre:
-
-            precedent = 0
-
-            while processus.poll() is None:
-
-                verifier_temps(deadline)
-
-                temps_ecoule = int(
-                    time.perf_counter() - debut
-                )
-
-                barre.update(
-                    temps_ecoule - precedent
-                )
-
-                precedent = temps_ecoule
-
-                time.sleep(1)
-
+        while processus.poll() is None:
+            verifier_temps(deadline)
+            time.sleep(1)
         if processus.returncode != 0:
-
-            raise RuntimeError(
-                f"Echec de app.py : "
-                f"code {processus.returncode}"
-            )
-
+            raise RuntimeError(f"Echec de app.py : code {processus.returncode}")
     finally:
-
         arreter_processus(processus)
+    return time.perf_counter() - debut
 
-    duree = time.perf_counter() - debut
-
-    tqdm.write(
-        f"Segmentation terminee en {duree:.2f} secondes"
-    )
-
-    return duree
 
 
 # =====================================================================
@@ -1373,19 +916,8 @@ def traiter_video(
             fichier_etat
         )
 
-    tqdm.write(
-        f"Video : {identifiant}"
-    )
 
-    tqdm.write(
-        f"Nombre total de frames : "
-        f"{information['nombre_total_frames']}"
-    )
 
-    tqdm.write(
-        f"Duree video : "
-        f"{information['duree_video_secondes']:.2f} s"
-    )
 
     # -----------------------------------------------------------------
     # ETAPE 2 : VERIFICATION DE LA SEGMENTATION
@@ -1467,16 +999,6 @@ def traiter_video(
             fichier_etat
         )
 
-    else:
-
-        tqdm.write(
-            "Segmentation deja terminee."
-        )
-
-        tqdm.write(
-            "Passage direct a l'evaluation."
-        )
-
     # -----------------------------------------------------------------
     # ETAPE 4 : EVALUATION DE LA QUALITE
     # -----------------------------------------------------------------
@@ -1492,10 +1014,6 @@ def traiter_video(
         fichier_etat
     )
 
-    fichier_detail = (
-        dossier_video
-        / "qualite_segmentation.csv"
-    )
 
     (
         nombre_frames,
@@ -1504,7 +1022,6 @@ def traiter_video(
 
     ) = evaluer_video(
         video_segmentee,
-        fichier_detail,
         information["nombre_total_frames"],
         deadline
     )
@@ -1567,24 +1084,18 @@ def traiter_video(
         fichier_resultats
     )
 
-    tqdm.write(
-        f"\nVideo terminee : {identifiant}"
-    )
+    # La sauvegarde est terminee : supprimer les sorties de cette video.
+    try:
+        shutil.rmtree(dossier_segmentation)
+        if not any(dossier_video.iterdir()):
+            dossier_video.rmdir()
+    except OSError as erreur:
+        print(f"Nettoyage incomplet : {erreur}", file=sys.stderr)
 
-    tqdm.write(
-        f"Frames correctement segmentees : "
-        f"{pct_correctes:.2f} %"
-    )
 
-    tqdm.write(
-        f"Frames mal segmentees : "
-        f"{pct_incorrectes:.2f} %"
-    )
 
-    tqdm.write(
-        f"Duree segmentation : "
-        f"{information['duree_segmentation_secondes']:.2f} s"
-    )
+
+
 
 
 # =====================================================================
@@ -1611,9 +1122,6 @@ def executer_pipeline(
         output_dir / "resultats_segmentation.csv"
     )
 
-    fichier_erreurs = (
-        output_dir / "erreurs_segmentation.csv"
-    )
 
     # Chargement des traitements precedents
     etat = charger_etat(fichier_etat)
@@ -1735,41 +1243,11 @@ def executer_pipeline(
         for information in etat.values()
     )
 
-    print("\n" + "=" * 70)
-
-    print("PIPELINE DE SEGMENTATION ET EVALUATION")
-
-    print("=" * 70)
-
-    print(
-        f"Nombre total de videos : {len(videos)}"
-    )
-
-    print(
-        f"Videos deja terminees : {nombre_terminees}"
-    )
-
-    print(
-        f"Videos restantes : "
-        f"{len(videos) - nombre_terminees}"
-    )
-
-    print(
-        f"Temps de calcul disponible : "
-        f"{temps_disponible / 3600:.2f} heures"
-    )
-
-    print("=" * 70 + "\n")
-
     exporter_resultats(
         etat,
         fichier_resultats
     )
 
-    exporter_erreurs(
-        etat,
-        fichier_erreurs
-    )
 
     try:
 
@@ -1850,10 +1328,6 @@ def executer_pipeline(
                         fichier_etat
                     )
 
-                    exporter_erreurs(
-                        etat,
-                        fichier_erreurs
-                    )
 
     except FinReservation as erreur:
 
@@ -1876,80 +1350,8 @@ def executer_pipeline(
             fichier_resultats
         )
 
-        exporter_erreurs(
-            etat,
-            fichier_erreurs
-        )
 
-        nombre_terminees = sum(
-
-            information.get("statut") == "terminee"
-
-            for information in etat.values()
-        )
-
-        nombre_erreurs = sum(
-
-            bool(information.get("erreur"))
-
-            for information in etat.values()
-        )
-
-        duree_execution = (
-            time.monotonic() - debut_execution
-        )
-
-        print("\n" + "=" * 70)
-
-        print("BILAN DE L'EXECUTION")
-
-        print("=" * 70)
-
-        print(
-            f"Videos terminees : "
-            f"{nombre_terminees}/{len(videos)}"
-        )
-
-        print(
-            f"Videos restantes : "
-            f"{len(videos) - nombre_terminees}"
-        )
-
-        print(
-            f"Videos avec erreur : {nombre_erreurs}"
-        )
-
-        print(
-            f"Temps de cette execution : "
-            f"{duree_execution / 3600:.2f} heures"
-        )
-
-        print(
-            f"\nResultats : {fichier_resultats}"
-        )
-
-        print(
-            f"Etat : {fichier_etat}"
-        )
-
-        print(
-            f"Erreurs : {fichier_erreurs}"
-        )
-
-        if nombre_terminees == len(videos):
-
-            print(
-                "\nToutes les videos ont ete traitees."
-            )
-
-        else:
-
-            print(
-                "\nRelancer la meme commande "
-                "pour poursuivre le traitement."
-            )
-
-        print("=" * 70)
+        print(f"Resultats : {fichier_resultats}")
 
 
 # =====================================================================
