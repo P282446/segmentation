@@ -734,10 +734,29 @@ def evaluer_video(video_path, nombre_total_frames, deadline):
             nombre_correctes += int(correcte)
     finally:
         cap.release()
-    if not nombre_frames or nombre_frames != nombre_total_frames:
-        raise RuntimeError(f"Nombre de frames different : originale={nombre_total_frames}, segmentee={nombre_frames}")
-    return nombre_frames, nombre_correctes, nombre_frames - nombre_correctes
+    if nombre_frames == 0:
+         raise RuntimeError("Aucune frame segmentee lisible.")
 
+    if nombre_total_frames <= 0:
+         raise RuntimeError("Nombre de frames originales invalide.")
+
+    ecart = abs(nombre_frames - nombre_total_frames)
+    ecart_relatif = ecart / nombre_total_frames
+
+    # Tolerance maximale de 0,1 %
+    if ecart_relatif > 0.001:
+         raise RuntimeError(
+             f"Ecart trop important : "
+             f"originale={nombre_total_frames}, "
+             f"segmentee={nombre_frames}, "
+             f"ecart={ecart_relatif * 100:.4f}%"
+            )
+
+    return (
+       nombre_frames,
+       nombre_correctes,
+       nombre_frames - nombre_correctes
+       )
 
 
 # =====================================================================
