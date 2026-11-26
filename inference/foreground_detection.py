@@ -138,8 +138,12 @@ def quick_find_connected_component(array, point, target_size=(100, 100)):
     array_ = cv2.resize(array, (new_w, new_h), interpolation=cv2.INTER_AREA)
     quantize(array_, 0, 255, 128)
     labeled_image = ski.measure.label(array_, connectivity=1, return_num=False)
-    point_label = labeled_image[int(point[0] * h_factor),
-                                int(point[1] * w_factor)]
+    # point_label = labeled_image[int(point[0] * h_factor),
+    #                            int(point[1] * w_factor)]
+    h_max, w_max = labeled_image.shape[:2]
+    row = min(max(int(point[0] * h_factor), 0), h_max - 1)
+    col = min(max(int(point[1] * w_factor), 0), w_max - 1)
+    point_label = labeled_image[row, col]
     component = np.zeros_like(array_, dtype=np.uint8)
     component[labeled_image == point_label] = 255
     scaled_connected_component = np.zeros((height, width))
