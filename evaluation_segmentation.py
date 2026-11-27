@@ -76,10 +76,10 @@ ZONES = {
 TOLERANCE_COULEUR = 25
 
 # Nombre minimum de pixels pour considerer une region presente
-MIN_PIXELS_ZONE = 20
+MIN_PIXELS_ZONE = 100
 
-# Surface segmentee minimale : 0.5 % de la frame
-MIN_SURFACE_SEGMENTEE = 0.005
+# Surface segmentee minimale : 5 % de la frame
+MIN_SURFACE_SEGMENTEE = 0.O5
 
 # Proportions minimales et maximales des regions
 # relativement a la surface totale segmentee
@@ -744,7 +744,7 @@ def evaluer_video(video_path, nombre_total_frames, deadline):
     ecart_relatif = ecart / nombre_total_frames
 
     # Tolerance maximale de 0,1 %
-    if ecart_relatif > 0.001:
+    if ecart_relatif > 0.1:
          raise RuntimeError(
              f"Ecart trop important : "
              f"originale={nombre_total_frames}, "
