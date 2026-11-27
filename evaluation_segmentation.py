@@ -79,7 +79,7 @@ TOLERANCE_COULEUR = 25
 MIN_PIXELS_ZONE = 100
 
 # Surface segmentee minimale : 5 % de la frame
-MIN_SURFACE_SEGMENTEE = 0.O5
+MIN_SURFACE_SEGMENTEE = 0.05
 
 # Proportions minimales et maximales des regions
 # relativement a la surface totale segmentee
